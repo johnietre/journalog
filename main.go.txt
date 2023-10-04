@@ -1,0 +1,854 @@
+package main
+
+import (
+  "context"
+  "database/sql"
+  "encoding/json"
+  "flag"
+  "fmt"
+  logpkg "log"
+  "net/http"
+  "os"
+  "strconv"
+  "strings"
+  "sync"
+  "sync/atomic"
+  "time"
+
+  "github.com/gin-gonic/gin"
+  "github.com/google/uuid"
+  _ "github.com/mattn/go-sqlite3"
+  "golang.org/x/crypto/bcrypt"
+)
+
+const sessTimeout = int64(time.Hour) * 24 * 15
+
+func main() {
+  logpkg.SetFlags(0)
+
+  dbPath := flag.String("db", "", "Path to the database")
+  jdPath := flag.String("journals", "", "Path to the directory of journals")
+  indexPath := flag.String("index", "./index.html", "Path to the index HTML file")
+  addr := flag.String("addr", "", "Address to run on")
+  flag.Parse()
+
+  if *dbPath == "" {
+    logpkg.Fatal("must provide database path")
+  } else if *jdPath != "" {
+    logpkg.Fatal("must provide journal directory path")
+  } else if *addr == "" {
+    logpkg.Fatal("must provide address")
+  }
+
+  db, err := sql.Open("sqlite3", *dbPath)
+  if err != nil {
+    logpkg.Fatalf("error opening db: %v", err)
+  }
+  defer db.Close()
+
+  srvr := newServer(db, *jdPath)
+  srvr.indexPath = *indexPath
+  logpkg.Fatalf("error running server: %v", srvr.Run(*addr))
+}
+
+type server struct {
+  db *sql.DB
+  jdPath string
+  indexPath string
+
+  server *http.Server
+  router *http.ServeMux
+  sessions sync.Map
+}
+
+func newServer(db *sql.DB, jdPath string) *server {
+  router := http.NewServeMux()
+  srvr := &server{
+    db: db,
+    jdPath: jdPath,
+    indexPath: "index.html",
+    server: &http.Server{},
+    router: router,
+  }
+  return srvr
+}
+
+func (s *server) authMiddleware(h http.Handler) http.Handler {
+  return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+    id, ok := getId(r)
+    if ok {
+      iSess, ok := s.sessions.Load(id)
+      if !ok {
+        http.Error(w, "unauthorized", http.StatusUnauthorized)
+        return
+      }
+      sess := iSess.(*Session)
+      now := time.Now().Unix()
+      lastReq := sess.lastReq.Load()
+      if now - lastReq > sessTimeout {
+        http.Error(w, "unauthorized", http.StatusUnauthorized)
+        return
+      }
+      sess.lastReq.Store(now)
+      r = r.WithContext(context.WithValue(r.Context(), sessKey, sess))
+      h.ServeHTTP(w, r)
+      return
+    }
+    email, password, ok := r.BasicAuth()
+    if !ok {
+      http.Error(w, "invalid authorization", http.StatusBadRequest)
+      return
+    }
+    r = r.WithContext(
+      context.WithValue(r.Context(), credsKey, Creds{email, password}),
+    )
+    h.ServeHTTP(w, r)
+  })
+}
+
+func (s *server) homeHandler(w http.ResponseWriter, r *http.Request) {
+  // TODO: Load file into memory
+  http.ServeFile(w, r, s.indexPath)
+}
+
+func (s *server) registerHandler(w http.ResponseWriter, r *http.Request) {
+  iCreds := r.Context().Value(credsKey)
+  if iCreds == nil {
+    http.Error(w, "missing credentials", http.StatusBadRequest)
+    return
+  }
+  creds := iCreds.(Creds)
+  email, password := creds[0], creds[1]
+  if email == "" || password == "" {
+    http.Error(w, "missing credentials", http.StatusBadRequest)
+    return
+  }
+  pwdHash, err := bcrypt.GenerateFromPassword(
+    []byte(password), bcrypt.DefaultCost,
+  )
+  if err != nil {
+    http.Error(w, "bad credentials", http.StatusBadRequest)
+    return
+  }
+  if _, err := s.createUser(email, string(pwdHash)); err != nil {
+    // TODO: Change response depending on the error (i.e., if the user was
+    // added but the tables weren't both successfully created.
+    logpkg.Printf("Error creating user (email: %s): %v", err)
+    http.Error(w, "internal server error", http.StatusInternalServerError)
+    return
+  }
+  id := uuid.New().String()
+  s.insertSess(newSess(id, email))
+  w.Write([]byte(id))
+}
+
+func (s *server) loginHandler(w http.ResponseWriter, r *http.Request) {
+  iCreds := r.Context().Value(credsKey)
+  if iCreds == nil {
+    // TODO: Check if ID was provided
+    iSess := r.Context().Value(sessKey)
+    if iSess == nil {
+      http.Error(w, "missing credentials", http.StatusBadRequest)
+    } else {
+      w.Write([]byte(iSess.(*Session).Id))
+    }
+    return
+  }
+  creds := iCreds.(Creds)
+  email, password := creds[0], creds[1]
+  pwdHash, err := s.getPwdHash(email)
+  if err != nil {
+    http.Error(w, "internal server error", http.StatusInternalServerError)
+    logpkg.Printf("error getting password has for %s: %v", email, err)
+    return
+  }
+  if !checkPassword(password, pwdHash) {
+    http.Error(w, "invalid email or password", http.StatusUnauthorized)
+    return
+  }
+  id := uuid.New().String()
+  s.insertSess(newSess(id, email))
+  w.Write([]byte(id))
+}
+
+func (s *server) logoutHandler(w http.ResponseWriter, r *http.Request) {
+  iSess := r.Context().Value(sessKey)
+  if iSess != nil {
+    http.Error(w, "unauthorized", http.StatusUnauthorized)
+    return
+  }
+  sess := iSess.(*Session)
+  s.sessions.Delete(sess.Id)
+}
+
+func (s *server) addLogHandler(w http.ResponseWriter, r *http.Request) {
+  if r.Method != http.MethodPost {
+    http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+    return
+  }
+  iSess := r.Context().Value(sessKey)
+  if iSess != nil {
+    http.Error(w, "unauthorized", http.StatusUnauthorized)
+    return
+  }
+  var log Log
+  if err := json.NewDecoder(r.Body).Decode(&log); err != nil {
+    http.Error(w, "bad json", http.StatusBadRequest)
+    return
+  }
+  sess := iSess.(*Session)
+  email := sess.User.Email
+  resLog, err := s.addLog(email, log)
+  if err != nil {
+    logpkg.Printf("error adding log for email (log: %v): %v", log, err)
+    http.Error(w, "error adding log", http.StatusInternalServerError)
+    return
+  }
+  fmt.Fprint(w, resLog.Id)
+}
+
+func (s *server) getLogsHandler(w http.ResponseWriter, r *http.Request) {
+  if r.Method != http.MethodPost {
+    http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+    return
+  }
+  iSess := r.Context().Value(sessKey)
+  if iSess != nil {
+    http.Error(w, "unauthorized", http.StatusUnauthorized)
+    return
+  }
+  sess := iSess.(*Session)
+  email := sess.User.Email
+  opts := GetLogsOpts{}
+  if startStr := r.URL.Query().Get("start"); startStr != "" {
+    start, err := strconv.ParseInt(startStr, 10, 64)
+    if err != nil {
+      http.Error(w, "bad start time", http.StatusBadRequest)
+      return
+    }
+    opts.Start(start)
+  }
+  if endStr := r.URL.Query().Get("end"); endStr != "" {
+    end, err := strconv.ParseInt(endStr, 10, 64)
+    if err != nil {
+      http.Error(w, "bad end time", http.StatusBadRequest)
+      return
+    }
+    opts.End(end)
+  }
+  if limitStr := r.URL.Query().Get("limit"); limitStr != "" {
+    limit, err := strconv.ParseUint(limitStr, 10, 64)
+    if err != nil {
+      http.Error(w, "bad limit time", http.StatusBadRequest)
+      return
+    }
+    opts.Limit(limit)
+  }
+  if reversedStr := r.URL.Query().Get("reversed"); reversedStr != "" {
+    reversed, err := strconv.ParseBool(reversedStr)
+    if err != nil {
+      http.Error(w, "bad reversed value", http.StatusBadRequest)
+      return
+    }
+    opts.Reversed(reversed)
+  }
+  s.getLogs(email, opts)
+}
+
+func (s *server) deleteLogsHandler(w http.ResponseWriter, r *http.Request) {
+  if r.Method != http.MethodDelete {
+    http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+    return
+  }
+}
+
+func (s *server) addJournalHandler(w http.ResponseWriter, r *http.Request) {
+  if r.Method != http.MethodPost {
+    http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+    return
+  }
+  iSess := r.Context().Value(sessKey)
+  if iSess != nil {
+    http.Error(w, "unauthorized", http.StatusUnauthorized)
+    return
+  }
+  var journal Journal
+  if err := json.NewDecoder(r.Body).Decode(&journal); err != nil {
+    http.Error(w, "bad json", http.StatusBadRequest)
+    return
+  }
+  sess := iSess.(*Session)
+  email := sess.User.Email
+  resJournal, err := s.addJournal(email, journal)
+  if err != nil {
+    logpkg.Printf("error adding journal for email: %v", err)
+    http.Error(w, "error adding journal", http.StatusInternalServerError)
+    return
+  }
+  fmt.Fprint(w, resJournal.Id)
+}
+
+func (s *server) getJournalsHandler(w http.ResponseWriter, r *http.Request) {
+  if r.Method != http.MethodPost {
+    http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+    return
+  }
+  iSess := r.Context().Value(sessKey)
+  if iSess != nil {
+    http.Error(w, "unauthorized", http.StatusUnauthorized)
+    return
+  }
+  sess := iSess.(*Session)
+  email := sess.User.Email
+  opts := GetJournalsOpts{}
+  if startStr := r.URL.Query().Get("added_start"); startStr != "" {
+    start, err := strconv.ParseInt(startStr, 10, 64)
+    if err != nil {
+      http.Error(w, "bad added_start time", http.StatusBadRequest)
+      return
+    }
+    opts.AddedStart(start)
+  }
+  if endStr := r.URL.Query().Get("added_end"); endStr != "" {
+    end, err := strconv.ParseInt(endStr, 10, 64)
+    if err != nil {
+      http.Error(w, "bad added_end time", http.StatusBadRequest)
+      return
+    }
+    opts.AddedEnd(end)
+  }
+  if startStr := r.URL.Query().Get("for_start"); startStr != "" {
+    start, err := strconv.ParseInt(startStr, 10, 64)
+    if err != nil {
+      http.Error(w, "bad for_start time", http.StatusBadRequest)
+      return
+    }
+    opts.ForStart(start)
+  }
+  if endStr := r.URL.Query().Get("for_end"); endStr != "" {
+    end, err := strconv.ParseInt(endStr, 10, 64)
+    if err != nil {
+      http.Error(w, "bad for_end time", http.StatusBadRequest)
+      return
+    }
+    opts.ForEnd(end)
+  }
+  if limitStr := r.URL.Query().Get("limit"); limitStr != "" {
+    limit, err := strconv.ParseUint(limitStr, 10, 64)
+    if err != nil {
+      http.Error(w, "bad limit time", http.StatusBadRequest)
+      return
+    }
+    opts.Limit(limit)
+  }
+  if reversedStr := r.URL.Query().Get("added_reversed"); reversedStr != "" {
+    reversed, err := strconv.ParseBool(reversedStr)
+    if err != nil {
+      http.Error(w, "bad added_reversed value", http.StatusBadRequest)
+      return
+    }
+    opts.AddedReversed(reversed)
+  }
+  if reversedStr := r.URL.Query().Get("for_reversed"); reversedStr != "" {
+    reversed, err := strconv.ParseBool(reversedStr)
+    if err != nil {
+      http.Error(w, "bad for_reversed value", http.StatusBadRequest)
+      return
+    }
+    opts.AddedReversed(reversed)
+  }
+  s.getJournals(email, opts)
+}
+
+func (s *server) deleteJournalsHandler(w http.ResponseWriter, r *http.Request) {
+  // TODO
+}
+
+func (s *server) Run(addr string) error {
+  s.server.Addr = addr
+  s.server.Handler = s.router
+  return s.server.ListenAndServe()
+}
+
+func (s *server) Shutdown(ctx context.Context) error {
+  return s.server.Shutdown(ctx)
+}
+
+func (s *server) Close() error {
+  return s.server.Close()
+}
+
+func (s *server) createUser(email, pwdHash string) (User, error) {
+  var user User
+  res, err := s.db.Exec(`INSERT INTO users(email, password_hash) VALUES (?,?)`, email, pwdHash)
+  if err != nil {
+    return user, err
+  }
+  iid, err := res.LastInsertId()
+  if err != nil {
+    return user, err
+  }
+  user.Id, user.Email = uint64(iid), email
+  if _, err = s.db.Exec(fmt.Sprintf(createLogsTableStmt, user.Id)); err != nil {
+    return user, err
+  }
+  if _, err = s.db.Exec(fmt.Sprintf(createJournalsTableStmt, user.Id)); err != nil {
+    return user, err
+  }
+  return user, err
+}
+
+func (s *server) getPwdHash(email string) (string, error) {
+  row := s.db.QueryRow(`SELECT password_hash FROM users WHERE email=?`, email)
+  pwdHash := ""
+  err := row.Scan(&pwdHash)
+  if err != nil && err != sql.ErrNoRows {
+    err = nil
+  }
+  return pwdHash, err
+}
+
+func (s *server) addLog(email string, log Log) (Log, error) {
+  res, err := s.db.Exec(fmt.Sprintf(
+    `INSERT INTO [%s]_logs(timestamp, contents) VALUES (%d, %s)`,
+    email, log.Timestamp, log.Contents,
+  ))
+  if err != nil {
+    return Log{}, err
+  }
+  iid, err := res.LastInsertId()
+  if err != nil {
+    return Log{}, err
+  }
+  log.Id = uint64(iid)
+  return log, nil
+}
+
+func (s *server) getLogs(email string, opts GetLogsOpts) (logs []Log, err error) {
+  query := fmt.Sprintf(`SELECT * FROM [%s]_logs %s`, email, opts.StmtString())
+  rows, err := s.db.Query(query)
+  if err != nil {
+    return nil, err
+  }
+  var log Log
+  for rows.Next() {
+    if e := rows.Scan(&log.Id, &log.Timestamp, &log.Contents); e != nil {
+      if err == nil {
+        err = e
+      }
+      continue
+    }
+    logs = append(logs, log)
+  }
+  return logs, nil
+}
+
+func (s *server) deleteLogs(email string, opts DeleteLogsOpts) error {
+  stmt := fmt.Sprintf(`DELETE FROM [%s]_logs %s`, email, opts.StmtString())
+  if _, err := s.db.Exec(stmt); err != nil {
+    return err
+  }
+  return nil
+}
+
+func (s *server) addJournal(email string, journal Journal) (Journal, error) {
+  res, err := s.db.Exec(fmt.Sprintf(``))
+  if err != nil {
+    return Journal{}, err
+  }
+  iid, err := res.LastInsertId()
+  if err != nil {
+    return Journal{}, err
+  }
+  journal.Id = uint64(iid)
+  return journal, nil
+}
+
+func (s *server) getJournals(email string, opts GetJournalsOpts) (journals []Journal, err error) {
+  query := fmt.Sprintf(`SELECT * FROM [%s]_journals %s`, email, opts.StmtString())
+  rows, err := s.db.Query(query)
+  if err != nil {
+    return nil, err
+  }
+  var journal Journal
+  for rows.Next() {
+    journals = append(journals, journal)
+  }
+  return journals, nil
+}
+
+func (s *server) deleteJournals(email string, opts DeleteJournalsOpts) error {
+  stmt := fmt.Sprintf(`DELETE FROM [%s]_journals %s`, email, opts.StmtString())
+  if _, err := s.db.Exec(stmt); err != nil {
+    return err
+  }
+  return nil
+}
+
+func (s *server) insertSess(sess *Session) {
+  s.sessions.Store(sess.Id, sess)
+}
+
+func (s *server) saveSessions() error {
+  var sesses []*Session
+  s.sessions.Range(func(_, iSess any) bool {
+    sesses = append(sesses, iSess.(*Session))
+    return true
+  })
+  jsonBytes, err := json.Marshal(sesses)
+  if err != nil {
+    return err
+  }
+  // TODO
+  return os.WriteFile("", jsonBytes, 0755)
+}
+
+func getId(r *http.Request) (string, bool) {
+  auth := r.Header.Get("Authorization")
+  const prefix = "Bearer "
+  if len(auth) < len(prefix) || !strings.EqualFold(auth[:len(prefix)], prefix) {
+    return "", false
+  }
+  return auth[len(prefix):], true
+}
+
+func checkPassword(pwd, pwdHash string) bool {
+  return bcrypt.CompareHashAndPassword([]byte(pwdHash), []byte(pwd)) == nil
+}
+
+type User struct {
+  Id uint64
+  Email string
+  password string
+}
+
+type Log struct {
+  Id uint64 `json:"id"`
+  Timestamp int64 `json:"timestamp"`
+  Contents string `json:"text"`
+  StartId uint64 `json:"startId"`
+  EndId uint64 `json:"endId"`
+}
+
+type Journal struct {
+  Id uint64 `json:"id"`
+  For int64 `json:"for"`
+  AddedAt int64 `json:"addedAt"`
+  Contents string `json:"contents"`
+  path string
+}
+
+type Session struct {
+  Id string `json:"id"`
+  User User `json:"user"` 
+  lastReq atomic.Int64
+  mtx sync.Mutex
+}
+
+func newSess(id, email string) *Session {
+  sess := &Session{
+    Id: id,
+    User: User{Email: email},
+  }
+  sess.lastReq.Store(time.Now().Unix())
+  return sess
+}
+
+func (s *Session) MarshalJSON() ([]byte, error) {
+  idJSON, err := json.Marshal(s.Id)
+  if err != nil {
+    return nil, err
+  }
+  userJSON, err := json.Marshal(s.User)
+  if err != nil {
+    return nil, err
+  }
+  lastReqJSON, err := json.Marshal(s.lastReq.Load())
+  if err != nil {
+    return nil, err
+  }
+  jsonStr := fmt.Sprintf(
+    `{"id":%s,"user":%s,"lastReq":%s}`,
+    idJSON, userJSON, lastReqJSON,
+  )
+  return []byte(jsonStr), nil
+}
+
+type GetLogsOpts struct {
+  start, end *int64
+  limit *uint64
+  reversed bool
+}
+
+func (opts *GetLogsOpts) Start(start int64) *GetLogsOpts {
+  opts.start = newT(start)
+  return opts
+}
+
+func (opts *GetLogsOpts) End(end int64) *GetLogsOpts {
+  opts.end = newT(end)
+  return opts
+}
+
+func (opts *GetLogsOpts) Limit(limit uint64) *GetLogsOpts {
+  opts.limit = newT(limit)
+  return opts
+}
+
+func (opts *GetLogsOpts) Reversed(reversed bool) *GetLogsOpts {
+  opts.reversed = reversed
+  return opts
+}
+
+func (opts *GetLogsOpts) StmtString() string {
+  stmt := ""
+  if opts.start != nil && opts.end != nil {
+    stmt = fmt.Sprintf("WHERE timestamp BETWEEN %d AND %d", *opts.start, *opts.end)
+  } else if opts.start != nil {
+    stmt = fmt.Sprintf("WHERE timestamp >= %d", *opts.start)
+  } else if opts.end != nil {
+    stmt = fmt.Sprintf("WHERE timestamp <= %d", *opts.end)
+  }
+  if opts.limit != nil {
+    stmt += fmt.Sprintf(" LIMIT %d", *opts.limit)
+  }
+  if !opts.reversed {
+    stmt += " ORDER BY timestamp"
+  } else {
+    stmt += " ORDER BY timestamp DESC"
+  }
+  return stmt
+}
+
+type DeleteLogsOpts struct {
+  start, end *int64
+  ids []uint64
+}
+
+func (opts *DeleteLogsOpts) Start(start int64) *DeleteLogsOpts {
+  opts.start = newT(start)
+  return opts
+}
+
+func (opts *DeleteLogsOpts) End(end int64) *DeleteLogsOpts {
+  opts.end = newT(end)
+  return opts
+}
+
+func (opts *DeleteLogsOpts) Id(id uint64) *DeleteLogsOpts {
+  opts.ids = append(opts.ids, id)
+  return opts
+}
+
+func (opts *DeleteLogsOpts) Ids(ids []uint64) *DeleteLogsOpts {
+  opts.ids = ids
+  return opts
+}
+
+// StmtString returns the string of the options to be passed with the database
+// statment.
+func (opts *DeleteLogsOpts) StmtString() string {
+  stmt := ""
+  if opts.start != nil && opts.end != nil {
+    stmt = fmt.Sprintf("WHERE timestamp BETWEEN %d AND %d", *opts.start, *opts.end)
+  } else if opts.start != nil {
+    stmt = fmt.Sprintf("WHERE timestamp >= %d", *opts.start)
+  } else if opts.end != nil {
+    stmt = fmt.Sprintf("WHERE timestamp <= %d", *opts.end)
+  }
+  if len(opts.ids) != 0 {
+    strIds := mapSlice(opts.ids, func(id uint64) string { return fmt.Sprint(id) })
+    if stmt != "" {
+      stmt += " OR id IN" + strings.Join(strIds, ",")
+    } else {
+      stmt = "WHERE id IN" + strings.Join(strIds, ",")
+    }
+  }
+  return stmt
+}
+
+type GetJournalsOpts struct {
+  addedStart, addedEnd *int64
+  forStart, forEnd *int64
+  limit *uint64
+  addedReversed, forReversed bool
+}
+
+func (opts *GetJournalsOpts) AddedStart(start int64) *GetJournalsOpts {
+  opts.addedStart = newT(start)
+  return opts
+}
+
+func (opts *GetJournalsOpts) AddedEnd(end int64) *GetJournalsOpts {
+  opts.addedEnd = newT(end)
+  return opts
+}
+
+func (opts *GetJournalsOpts) ForStart(start int64) *GetJournalsOpts {
+  opts.forStart = newT(start)
+  return opts
+}
+
+func (opts *GetJournalsOpts) ForEnd(end int64) *GetJournalsOpts {
+  opts.forEnd = newT(end)
+  return opts
+}
+
+func (opts *GetJournalsOpts) Limit(limit uint64) *GetJournalsOpts {
+  opts.limit = newT(limit)
+  return opts
+}
+
+func (opts *GetJournalsOpts) AddedReversed(reversed bool) *GetJournalsOpts {
+  opts.addedReversed = reversed
+  return opts
+}
+
+func (opts *GetJournalsOpts) ForReversed(reversed bool) *GetJournalsOpts {
+  opts.forReversed = reversed
+  return opts
+}
+
+func (opts *GetJournalsOpts) StmtString() string {
+  stmt := ""
+  var conds []string
+  if opts.addedStart != nil && opts.addedEnd != nil {
+    conds = append(conds, fmt.Sprintf("added_at BETWEEN %d AND %d", *opts.addedStart, *opts.addedEnd))
+  } else if opts.addedStart != nil {
+    conds = append(conds, fmt.Sprintf("added_at >= %d", *opts.addedStart))
+  } else if opts.addedEnd != nil {
+    conds = append(conds, fmt.Sprintf("added_at <= %d", *opts.addedEnd))
+  }
+  if opts.forStart != nil && opts.forEnd != nil {
+    conds = append(conds, fmt.Sprintf("for BETWEEN %d AND %d", *opts.forStart, *opts.forEnd))
+  } else if opts.forStart != nil {
+    conds = append(conds, fmt.Sprintf("for >= %d", *opts.forStart))
+  } else if opts.forEnd != nil {
+    conds = append(conds, fmt.Sprintf("for <= %d", *opts.forEnd))
+  }
+  if len(conds) != 0 {
+    stmt = "WHERE " + strings.Join(conds, " AND ")
+  }
+  if opts.limit != nil {
+    stmt += fmt.Sprintf(" LIMIT %d", *opts.limit)
+  }
+  if !opts.addedReversed {
+    stmt += " ORDER BY added_at"
+  } else {
+    stmt += " ORDER BY added_at DESC"
+  }
+  if !opts.forReversed {
+    stmt += " ORDER BY for"
+  } else {
+    stmt += " ORDER BY for DESC"
+  }
+  return stmt
+}
+
+type DeleteJournalsOpts struct {
+  addedStart, addedEnd *int64
+  forStart, forEnd *int64
+  ids []uint64
+}
+
+func (opts *DeleteJournalsOpts) AddedStart(start int64) *DeleteJournalsOpts {
+  opts.addedStart = newT(start)
+  return opts
+}
+
+func (opts *DeleteJournalsOpts) AddedEnd(end int64) *DeleteJournalsOpts {
+  opts.addedEnd = newT(end)
+  return opts
+}
+
+func (opts *DeleteJournalsOpts) ForStart(start int64) *DeleteJournalsOpts {
+  opts.forStart = newT(start)
+  return opts
+}
+
+func (opts *DeleteJournalsOpts) ForEnd(end int64) *DeleteJournalsOpts {
+  opts.forEnd = newT(end)
+  return opts
+}
+
+func (opts *DeleteJournalsOpts) Id(id uint64) *DeleteJournalsOpts {
+  opts.ids = append(opts.ids, id)
+  return opts
+}
+
+func (opts *DeleteJournalsOpts) Ids(ids []uint64) *DeleteJournalsOpts {
+  opts.ids = ids
+  return opts
+}
+
+// StmtString returns the string of the options to be passed with the database
+// statment.
+func (opts *DeleteJournalsOpts) StmtString() string {
+  stmt := ""
+  var conds []string
+  if opts.addedStart != nil && opts.addedEnd != nil {
+    conds = append(conds, fmt.Sprintf("added_at BETWEEN %d AND %d", *opts.addedStart, *opts.addedEnd))
+  } else if opts.addedStart != nil {
+    conds = append(conds, fmt.Sprintf("added_at >= %d", *opts.addedStart))
+  } else if opts.addedEnd != nil {
+    conds = append(conds, fmt.Sprintf("added_at <= %d", *opts.addedEnd))
+  }
+  if opts.forStart != nil && opts.forEnd != nil {
+    conds = append(conds, fmt.Sprintf("for BETWEEN %d AND %d", *opts.forStart, *opts.forEnd))
+  } else if opts.forStart != nil {
+    conds = append(conds, fmt.Sprintf("for >= %d", *opts.forStart))
+  } else if opts.forEnd != nil {
+    conds = append(conds, fmt.Sprintf("for <= %d", *opts.forEnd))
+  }
+  if len(opts.ids) != 0 {
+    strIds := mapSlice(opts.ids, func(id uint64) string { return fmt.Sprint(id) })
+    conds = append(conds, "id IN" + strings.Join(strIds, ","))
+  }
+  if len(conds) != 0 {
+    stmt = "WHERE " + strings.Join(conds, " AND ")
+  }
+  return stmt
+}
+
+func newT[T any](t T) *T {
+  ptr := new(T)
+  *ptr = t
+  return ptr
+}
+
+func mapSlice[T, U any](s []T, f func(T) U) []U {
+  res := make([]U, len(s))
+  for i, e := range s {
+    res[i] = f(e)
+  }
+  return res
+}
+
+type Creds [2]string
+
+type sessCtxKey string
+type credsCtxKey string
+
+const (
+  sessKey sessCtxKey = "sess"
+  credsKey credsCtxKey = "creds"
+)
+
+const createLogsTableStmt = `
+CREATE TABLE %[1]d_logs (
+  id INTEGER PRIMARY KEY NOT NULL,
+  timestamp INTEGER NOT NULL,
+  contents VARCHAR(255) NOT NULL
+);
+`
+
+const createJournalsTableStmt = `
+CREATE TABLE %[1]d_journals (
+  id INTEGER PRIMARY KEY NOT NULL,
+  for INTEGER NOT NULL, -- The timestamp of the day the journal is for
+  added_at INTEGER NOT NULL, -- The timestamp the journal was added at
+  path VARCHAR(255) NOT NULL -- The path or name of the file with the contents
+);
+`
+
+const createTablesStmt = createJournalsTableStmt + createLogsTableStmt
