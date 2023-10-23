@@ -2,7 +2,7 @@ CREATE TABLE users (
   id INTEGER PRIMARY KEY,
   email TEXT NOT NULL UNIQUE,
   password_hash TEXT NOT NULL,
-  created_at INTEGER NOT NULL,
+  created_at INTEGER NOT NULL
 );
 
 CREATE TABLE logs (
@@ -10,7 +10,7 @@ CREATE TABLE logs (
   user_id INTEGER NOT NULL,
   timestamp INTEGER NOT NULL,
   contents TEXT NOT NULL,
-  FOREIGN KEY(user_id) REFERENCES users(id)
+  FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 
 CREATE TABLE journals (
@@ -22,4 +22,5 @@ CREATE TABLE journals (
   added_at INTEGER NOT NULL,
   -- Path relative to the journals directory
   path TEXT NOT NULL,
+  FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
 );
