@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+
+<html lang="en-US">
+
+<head>
+  <title>JournaLog</title>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <script src="https://unpkg.com/vue@3"></script>
+<style>
+html {
+  height: 95%;
+}
+body, #app {
+  height: 100%;
+  margin: none;
+  padding: none;
+}
+h1, h2 {
+  text-align: center;
+}
+table, th, td {
+  border: 1px solid black;
+  border-collapse: collapse;
+  padding: 2px;
+}
+#main-div {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+#content-div {
+  height: 100%;
+}
+#logs-div, #journals-div {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  height: 100%;
+}
+#logs-table-div {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+</style>
+</head>
+
+<body>
+  <div id="app">
+    <div id="login-register-div" v-if="!loggedIn">
+      <input type="email" placeholder="Email" v-model="email" /><br />
+      <input type="password" placeholder="Password" v-model="password" /><br />
+      <button @click="login">Login</button>
+      <button @click="register">Register</button>
+    </div>
+
+    <div id="main-div" v-else>
+      <div id="nav-logout-div">
+        <button @click="showLogs" :disabled="!showingJournals">Logs</button>
+        <button
+          @click="showJournals" :disabled="showingJournals"
+        >Journals</button>
+        <button @click="logout">Logout</button>
+      </div>
+      <h1>JournaLog</h1>
+      <div id="content-div">
+        <div id="logs-div" v-if="!showingJournals">
+          <h2>Logs</h2>
+          <input
+            type="text" placeholder="Log"
+            @keyup.enter="sendLog" v-model="log.contents" />
+          <br />
+          <div>
+            <button @click="sendLog">Send</button>
+            <button @click="clearLog">Clear</button><br />
+          </div>
+          <hr width="80%" />
+          <div id="logs-table-div">
+            <div style="margin:5px">
+              <button @click="getLogs">Get Logs</button>
+              <button @click="clearLogs">Clear Logs</button>
+            </div>
+            <table>
+              <tr>
+                <th>Time</th>
+                <th>Contents</th>
+                <th>Delete</th>
+              </tr>
+              <tr v-for="(log, i) in logs">
+                <td>{{tsToDateTime(log.timestamp)}}</td>
+                <td>{{log.contents}}</td>
+                <td @click="deleteLog(i)" style="text-align:center">X</td>
+              </tr>
+            </table>
+          </div>
+        </div>
+        <div id="journals-div" v-else>
+          <h2>Journals</h2>
+          <div>
+            <button
+              @click="sendJournal" :disabled="journalShowing!=-1"
+            >Send</button>
+            <button
+              @click="clearJournal" :disabled="journalShowing!=-1"
+            >Clear</button>
+          </div>
+          <br />
+          <input id="journal-date-input" type="date" v-model="journalDate" />
+          <textarea
+            rows=10 wrap="soft"
+            style="width:80%;hieght:60%;"
+            v-model="journal.contents"
+            :disabled="journalShowing!=-1"
+          ></textarea>
+          <hr style="width:80%" />
+          <div id="journals-table-div">
+            <div style="margin:5px">
+              <button @click="getJournals">Get Journals</button>
+              <button @click="clearJournals">Clear Journals</button>
+            </div>
+            <table>
+              <tr>
+                <th>Date</th>
+                <th>Added At</th>
+                <th>Show</th>
+                <th>Delete</th>
+              </tr>
+              <tr v-for="(journal, i) in journals">
+                <td>{{tsToDate(journal.timestamp)}}</td>
+                <td>{{tsToDateTime(journal.addedAt)}}</td>
+                <td>
+                  <button
+                    @click="showJournal(i)"
+                  >{{(journalShowing==i) ? "Hide" : "Show"}}</button>
+                </td>
+                <td @click="deleteJournal(i)" style="text-align:center">X</td>
+              </tr>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+<script>
+function makeBasicAuth(email, password) {
+  return "Basic " + btoa(email+":"+password);
+}
+function newJournal() {
+  return {timestamp: 0, addedAt: 0, contents: ""}
+}
+function newLog() {
+  return {timestamp: 0, contents: ""}
+}
+async function alertRespErr(status, text) {
+  alert(`Error (status ${status}): ${text}`);
+}
+const App = {
+  data() {
+    return {
+      email: "",
+      password: "",
+      loggedIn: false,
+
+      showingJournals: false,
+
+      log: newLog(),
+      logs: [],
+
+      journal: newJournal(),
+      journalDate: new Date(),
+      currJournal: newJournal(),
+      journals: [],
+      journalShowing: -1,
+
+      jwt: ""
+    };
+  },
+  async mounted() {
+    // TODO: Put in method?
+    const resp = await fetch("/users");
+    this.loggedIn = resp.ok;
+  },
+  methods: {
+    showLogs() {
+      this.showingJournals = false;
+    },
+    showJournals() {
+      this.showingJournals = true;
+    },
+    async getLogs() {
+      const resp = await this.sendReq("/logs?time_desc=1", "GET");
+      if (!resp.ok) {
+        alertRespErr(resp.status, await resp.text());
+        return;
+      }
+      const respJson = await resp.json();
+      if (respJson.error) {
+        alert(`Partial error: ${respJson.error}`);
+      } else {
+        alert(`Success`);
+      }
+      this.logs = respJson.data;
+    },
+    clearLogs() {
+      this.logs = [];
+    },
+    async sendLog() {
+      if (this.log.contents == "") {
+        return;
+      }
+      this.log.timestamp = Math.floor((new Date()).getTime() / 1000);
+      const resp = await this.sendReq("/logs", "POST", this.log);
+      if (!resp.ok) {
+        alertRespErr(resp.status, await resp.text());
+        return;
+      }
+      alert("Success!");
+    },
+    clearLog() {
+      this.log = newLog();
+    },
+    async deleteLog(index) {
+      const log = this.logs[index];
+      const conf = confirm(
+        `Delete log at ${this.tsToDateTime(log.timestamp)}: ${log.contents}`,
+      );
+      if (!conf) {
+        return;
+      }
+      const resp = await this.sendReq(`/logs/${log.id}`, "DELETE");
+      if (!resp.ok) {
+        alertRespErr(resp.status, await resp.text());
+        return;
+      }
+      this.logs.splice(index, 1);
+      alert("Success");
+    },
+    async getJournals() {
+      const resp = await this.sendReq("/journals?time_desc=1", "GET");
+      if (!resp.ok) {
+        alertRespErr(resp.status, await resp.text());
+        return;
+      }
+      const respJson = await resp.json();
+      if (respJson.error) {
+        alert(`Partial error: ${respJson.error}`);
+      } else {
+        alert(`Success`);
+      }
+      this.journals = respJson.data;
+    },
+    clearJournals() {
+      this.journals = [];
+      this.journalShowing = -1;
+      this.journal = this.currJournal;
+    },
+    async showJournal(index) {
+      const toShow = (this.journalShowing == index) ? -1 : index;
+      if (toShow == -1) {
+        this.journal = this.currJournal;
+      } else {
+        let journal = this.journals[index];
+        if (!journal.contents) {
+          journal = await this.getJournal(journal.id);
+          if (journal === undefined) {
+            return;
+          }
+          this.journals[index] = journal;
+        }
+        this.journal = journal;
+      }
+      this.journalShowing = toShow;
+    },
+    hideJournal() {
+      this.journalShowing = -1;
+    },
+    async getJournal(id) {
+      const resp = await this.sendReq(`/journals/${id}`);
+      if (!resp.ok) {
+        alertRespErr(resp.status, await resp.text());
+        return;
+      }
+      return (await resp.json()).data;
+    },
+    async sendJournal() {
+      const dateStr = document.querySelector("#journal-date-input").value;
+      const utcDate = new Date(dateStr);
+      // Must convert the parsed time (from UTC to local). getTimezoneOffset
+      // returns the offset in minutes so multiply by 60000 to get millis
+      const date = new Date(
+        utcDate.getTime() + (new Date()).getTimezoneOffset() * 60000
+      );
+      date.setHours(0); date.setMinutes(0); date.setSeconds(0);
+      date.setMilliseconds(0);
+      this.journal.timestamp = date.getTime() / 1000;
+      this.journal.addedAt = Math.floor((new Date()).getTime() / 1000);
+      const resp = await this.sendReq("/journals", "POST", this.journal);
+      if (!resp.ok) {
+        alert(`Error (status ${resp.status}): ` + (await resp.text()));
+        return;
+      }
+      alert("Success!");
+    },
+    clearJournal() {
+      this.currJournal = newJournal();
+      this.journal = this.currJournal;
+    },
+    async deleteJournal(index) {
+      const journal = this.journals[index];
+      const conf = confirm(
+        `Delete journal at ${this.tsToDateTime(journal.timestamp)}?`,
+      );
+      if (!conf) {
+        return;
+      }
+      const resp = await this.sendReq(`/journals/${journal.id}`, "DELETE");
+      if (!resp.ok) {
+        alertRespErr(resp.status, await resp.text());
+        return;
+      }
+      this.journals.splice(index, 1);
+      alert("Success");
+    },
+    tsToDateTime(ts) {
+      return (new Date(ts * 1000)).toLocaleString();
+    },
+    tsToDate(ts) {
+      return (new Date(ts * 1000)).toLocaleDateString();
+    },
+    async login() {
+      this.send("/login");
+    },
+    async register() {
+      this.send("/register", JSON.stringify({"email": this.email}));
+    },
+    async send(urlStr, body) {
+      const hasCooks = navigator.cookieEnabled;
+      if (!hasCooks) {
+        urlStr += "?no_cookie=1";
+      }
+      const headers = new Headers();
+      headers.append(
+        "Authorization",
+        makeBasicAuth(this.email, this.password),
+      );
+      const resp = await fetch(urlStr, {
+        method: "POST",
+        headers: headers,
+        body: body,
+      });
+      const text = await resp.text();
+      if (!resp.ok) {
+        alert(`Status ${resp.status}: ${text}`);
+        return;
+      }
+      if (!hasCooks) {
+        this.jwt = text;
+        return;
+      }
+      this.email = "", this.password = "", this.loggedIn = true;
+    },
+    async logout() {
+      // TODO: If no cookie?
+      if (this.jwt == "") {
+        fetch("/logout", {method: "POST"})
+          .catch((e) => alert(`Error logging out: ${e}`));
+      }
+      this.jwt = "", this.loggedIn = false;
+    },
+    async sendReq(urlStr, method, body) {
+      if (typeof body === "object") {
+        body = JSON.stringify(body);
+      }
+      const headers =  new Headers();
+      if (this.jwt != "") {
+        headers.append("Authorization", "Bearer " + this.jwt);
+      }
+      return fetch(urlStr, {method: method, headers: headers, body: body})
+    }
+  }
+};
+Vue.createApp(App).mount("#app");
+</script>
+</body>
+
+</html>

@@ -14,6 +14,7 @@ import (
 	"net/mail"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -23,6 +24,7 @@ import (
 	chi "github.com/go-chi/chi/v5"
 	_ "github.com/go-chi/chi/v5/middleware"
 	jwtauth "github.com/go-chi/jwtauth/v5"
+  _ "github.com/mattn/go-sqlite3"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -42,13 +44,23 @@ var (
 	errUserExists         = fmt.Errorf("user already exists")
 	errLogNotExist        = fmt.Errorf("log not exist")
 	errJournalNotExist    = fmt.Errorf("journal doesn't exist")
+
+  indexFilePath = ""
 )
 
+func init() {
+  _, thisFile, _, _ := runtime.Caller(0)
+  thisDir := filepath.Dir(thisFile)
+  indexFilePath = filepath.Join(thisDir, "index.html")
+}
+
 func main() {
+  logpkg.SetFlags(logpkg.Lshortfile)
+
 	addr := flag.String("addr", "127.0.0.1:8000", "Address to run on")
 	dbPath := flag.String("db", "journalog.db", "Path to database")
 	journalsDir := flag.String(
-		"journals-dir", "./journals", "Journals directory",
+		"journals-dir", "./journalog-journals", "Journals directory",
 	)
 	flag.Parse()
 
@@ -62,23 +74,27 @@ func main() {
 	}
 
 	r := chi.NewMux()
+  r.Use(jwtauth.Verify(
+    s.tokenAuth,
+    jwtauth.TokenFromHeader,
+    func(r *http.Request) string {
+      cookie, err := r.Cookie(jwtCookieName)
+      if err != nil {
+        return ""
+      }
+      return cookie.Value
+    },
+  ))
+  r.Get("/", s.HomeHandler)
+
 	// Other
 	// TODO: Register vs new client
 	r.Post("/login", s.LoginHandler)
+	r.Post("/register", s.NewUserHandler)
 	r.Post("/users", s.NewUserHandler)
 
 	r.Group(func(r chi.Router) {
-		r.Use(jwtauth.Verify(
-			s.tokenAuth,
-			jwtauth.TokenFromHeader,
-			func(r *http.Request) string {
-				cookie, err := r.Cookie(jwtCookieName)
-				if err != nil {
-					return ""
-				}
-				return cookie.Value
-			},
-		))
+    r.Use(jwtauth.Authenticator)
 		r.Post("/logout", s.LogoutHandler)
 		// Users
 		r.Get("/users", s.GetUserHandler)
@@ -119,12 +135,8 @@ func newServer(dbPath, jwtSecret, journalsDir string) (*Server, error) {
 	}, nil
 }
 
-func sendErrResp(w http.ResponseWriter, r *http.Request, resp *Resp) {
-	if wantsHTML(r) {
-		w.Write([]byte(resp.Error))
-	} else {
-		resp.WriteTo(w)
-	}
+func (s *Server) HomeHandler(w http.ResponseWriter, r *http.Request) {
+  http.ServeFile(w, r, indexFilePath)
 }
 
 func (s *Server) LoginHandler(w http.ResponseWriter, r *http.Request) {
@@ -174,7 +186,7 @@ func (s *Server) checkPassword(email, password string) (uint64, error) {
 		`SELECT id,password_hash FROM users WHERE email=?`, email,
 	)
 	id, hash := uint64(0), ""
-	if err := row.Scan(&hash); err != nil {
+	if err := row.Scan(&id, &hash); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return 0, errUserNotExist
 		}
@@ -499,6 +511,7 @@ func (s *Server) NewLogHandler(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewDecoder(r.Body).Decode(&log); err != nil {
 		// TODO: Handle errors
 		newRespErr(statusBR, "invalid log object").WriteTo(w)
+    return
 	}
 	log.UserId = userId
 	if log.Timestamp <= 0 {
@@ -564,7 +577,7 @@ type Journal struct {
 	UserId uint64 `json:"userId,omitempty"`
 	// The timestamp (day) the Journal is for
 	//ForTimestamp int64 `json:"forTimestamp"`
-	Timestamp int64  `json:"forTimestamp"`
+	Timestamp int64  `json:"timestamp"`
 	AddedAt   int64  `json:"addedAt,omitempty"`
 	Contents  string `json:"contents,omitempty"`
 	// Path to file
@@ -700,7 +713,7 @@ func (s *Server) GetJournalsHandler(w http.ResponseWriter, r *http.Request) {
 func (s *Server) getJournals(
 	userId uint64, opts GetJournalsOpts,
 ) ([]Journal, error) {
-	stmt := `SELECT id,timestamp,contents FROM journals WHERE user_id=?`
+	stmt := `SELECT id,timestamp,added_at FROM journals WHERE user_id=?`
 
 	rows, err := s.db.Query(stmt+opts.makeQuery(), userId)
 	if err != nil {
@@ -710,10 +723,10 @@ func (s *Server) getJournals(
 	for rows.Next() {
 		journal := Journal{UserId: userId}
 		if e := rows.Scan(
-			&journal.Id, &journal.Timestamp, &journal.Contents,
+			&journal.Id, &journal.Timestamp, &journal.AddedAt,
 		); e != nil {
 			// Set to first error
-			if err != nil {
+			if err == nil {
 				err = e
 			}
 		} else {
@@ -781,11 +794,13 @@ func (s *Server) NewJournalHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	journal := Journal{}
-	if journal.Contents == "" {
-		newRespErr(statusBR, "empty journal contents").WriteTo(w)
-	} else if err := json.NewDecoder(r.Body).Decode(&journal); err != nil {
+	if err := json.NewDecoder(r.Body).Decode(&journal); err != nil {
 		// TODO: Handle errors
 		newRespErr(statusBR, "invalid journal object").WriteTo(w)
+    return
+  } else if journal.Contents == "" {
+		newRespErr(statusBR, "empty journal contents").WriteTo(w)
+    return
 	}
 	journal.UserId = userId
 	if journal.Timestamp <= 0 {
@@ -813,7 +828,7 @@ func (s *Server) NewJournalHandler(w http.ResponseWriter, r *http.Request) {
 // Server.journalsDir).
 func (s *Server) generateJournalsDirPath(userId uint64) string {
 	return filepath.Join(
-		strconv.FormatUint((userId+1)/1000*1000, 10),
+		strconv.FormatUint((userId+1)/1000+1000, 10),
 		strconv.FormatUint(userId, 10),
 	)
 }
@@ -822,7 +837,7 @@ func (s *Server) generateJournalsDirPath(userId uint64) string {
 func (s *Server) generateJournalPath(userId, journalId uint64) string {
 	return filepath.Join(
 		s.generateJournalsDirPath(userId),
-		strconv.FormatUint(journalId, 10),
+		strconv.FormatUint(journalId, 10) + ".txt",
 	)
 }
 
@@ -849,7 +864,10 @@ func (s *Server) newJournal(journal *Journal) error {
 }
 
 func (s *Server) writeJournalContents(path, contents string) error {
-	return os.WriteFile(path, []byte(contents), 0755)
+	return os.WriteFile(
+    filepath.Join(s.journalsDir, path),
+    []byte(contents), 0755,
+  )
 }
 
 func (s *Server) DeleteJournalHandler(w http.ResponseWriter, r *http.Request) {
@@ -868,7 +886,7 @@ func (s *Server) DeleteJournalHandler(w http.ResponseWriter, r *http.Request) {
 			logpkg.Printf("error getting journal for ID %d: %v", userId, err)
 		}
 		newRespErr(status, errMsg).WriteTo(w)
-	} else if err := s.deleteJournal(userId, journalId); err != nil {
+	} else if err := s.deleteJournal(journal); err != nil {
 		status, errMsg := 0, ""
 		if errors.Is(err, errUserNotExist) {
 			status, errMsg = http.StatusUnauthorized, "user doesn't exist"
@@ -879,25 +897,20 @@ func (s *Server) DeleteJournalHandler(w http.ResponseWriter, r *http.Request) {
 			logpkg.Printf("error deleting journal for ID %d: %v", userId, err)
 		}
 		newRespErr(status, errMsg).WriteTo(w)
-	} else if err := s.deleteJournalContents(journal.path); err != nil {
-		newRespErr(statusISE, iseText).WriteTo(w)
-		logpkg.Printf("error deleting journal contents for ID %d: %v", userId, err)
 	} else {
 		newRespOk(nil).WriteTo(w)
 	}
 }
 
-func (s *Server) deleteJournal(userId, journalId uint64) error {
+func (s *Server) deleteJournal(journal Journal) error {
 	_, err := s.db.Exec(
 		`DELETE FROM journals WHERE id=? AND user_id=?`,
-		journalId, userId,
+		journal.Id, journal.UserId,
 	)
 	if err != nil {
 		return err
 	}
-	return os.Remove(
-		filepath.Join(s.journalsDir, s.generateJournalPath(userId, journalId)),
-	)
+  return s.deleteJournalContents(journal.path)
 }
 
 func (s *Server) deleteJournalContents(path string) error {
@@ -923,9 +936,24 @@ func newRespErr(status int, errMsg string) *Resp {
 }
 
 func (resp *Resp) WriteTo(w io.Writer) (n int64, err error) {
+  if rw, ok := w.(http.ResponseWriter); ok {
+    rw.Header().Set("Content-Type", "application/json")
+    rw.WriteHeader(resp.Status)
+    c := newCW(rw)
+    err = json.NewEncoder(c).Encode(resp)
+    return
+  }
 	c := newCW(w)
 	err = json.NewEncoder(c).Encode(resp)
 	return int64(c.N()), err
+}
+
+func sendErrResp(w http.ResponseWriter, r *http.Request, resp *Resp) {
+	if wantsHTML(r) {
+    http.Error(w, resp.Error, resp.Status)
+	} else {
+		resp.WriteTo(w)
+	}
 }
 
 type countWriter struct {
@@ -979,7 +1007,7 @@ func wantsHTML(r *http.Request) bool {
 }
 
 func acceptsCookies(r *http.Request) bool {
-	return r.URL.Query().Has("no_cookie")
+	return !r.URL.Query().Has("no_cookie")
 }
 
 func checkEmail(email string) bool {
@@ -993,5 +1021,5 @@ func hashPassword(pwd string) (string, error) {
 }
 
 func checkPassword(pwd, hash string) bool {
-	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(pwd)) != nil
+	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(pwd)) == nil
 }

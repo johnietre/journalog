@@ -1,11 +1,11 @@
-CREATE TABLE users (
+CREATE TABLE IF NOT EXISTS users (
   id INTEGER PRIMARY KEY,
   email TEXT NOT NULL UNIQUE,
   password_hash TEXT NOT NULL,
   created_at INTEGER NOT NULL
 );
 
-CREATE TABLE logs (
+CREATE TABLE IF NOT EXISTS logs (
   id INTEGER PRIMARY KEY,
   user_id INTEGER NOT NULL,
   timestamp INTEGER NOT NULL,
@@ -13,7 +13,7 @@ CREATE TABLE logs (
   FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 
-CREATE TABLE journals (
+CREATE TABLE IF NOT EXISTS journals (
   id INTEGER PRIMARY KEY,
   user_id INTEGER NOT NULL,
   -- The timestamp (day) the journal is for
