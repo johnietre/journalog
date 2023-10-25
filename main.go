@@ -24,7 +24,7 @@ import (
 	chi "github.com/go-chi/chi/v5"
 	_ "github.com/go-chi/chi/v5/middleware"
 	jwtauth "github.com/go-chi/jwtauth/v5"
-  _ "github.com/mattn/go-sqlite3"
+	_ "github.com/mattn/go-sqlite3"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -45,17 +45,17 @@ var (
 	errLogNotExist        = fmt.Errorf("log not exist")
 	errJournalNotExist    = fmt.Errorf("journal doesn't exist")
 
-  indexFilePath = ""
+	indexFilePath = ""
 )
 
 func init() {
-  _, thisFile, _, _ := runtime.Caller(0)
-  thisDir := filepath.Dir(thisFile)
-  indexFilePath = filepath.Join(thisDir, "index.html")
+	_, thisFile, _, _ := runtime.Caller(0)
+	thisDir := filepath.Dir(thisFile)
+	indexFilePath = filepath.Join(thisDir, "index.html")
 }
 
 func main() {
-  logpkg.SetFlags(logpkg.Lshortfile)
+	logpkg.SetFlags(logpkg.Lshortfile)
 
 	addr := flag.String("addr", "127.0.0.1:8000", "Address to run on")
 	dbPath := flag.String("db", "journalog.db", "Path to database")
@@ -74,18 +74,18 @@ func main() {
 	}
 
 	r := chi.NewMux()
-  r.Use(jwtauth.Verify(
-    s.tokenAuth,
-    jwtauth.TokenFromHeader,
-    func(r *http.Request) string {
-      cookie, err := r.Cookie(jwtCookieName)
-      if err != nil {
-        return ""
-      }
-      return cookie.Value
-    },
-  ))
-  r.Get("/", s.HomeHandler)
+	r.Use(jwtauth.Verify(
+		s.tokenAuth,
+		jwtauth.TokenFromHeader,
+		func(r *http.Request) string {
+			cookie, err := r.Cookie(jwtCookieName)
+			if err != nil {
+				return ""
+			}
+			return cookie.Value
+		},
+	))
+	r.Get("/", s.HomeHandler)
 
 	// Other
 	// TODO: Register vs new client
@@ -94,7 +94,7 @@ func main() {
 	r.Post("/users", s.NewUserHandler)
 
 	r.Group(func(r chi.Router) {
-    r.Use(jwtauth.Authenticator)
+		r.Use(jwtauth.Authenticator)
 		r.Post("/logout", s.LogoutHandler)
 		// Users
 		r.Get("/users", s.GetUserHandler)
@@ -136,7 +136,7 @@ func newServer(dbPath, jwtSecret, journalsDir string) (*Server, error) {
 }
 
 func (s *Server) HomeHandler(w http.ResponseWriter, r *http.Request) {
-  http.ServeFile(w, r, indexFilePath)
+	http.ServeFile(w, r, indexFilePath)
 }
 
 func (s *Server) LoginHandler(w http.ResponseWriter, r *http.Request) {
@@ -511,7 +511,7 @@ func (s *Server) NewLogHandler(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewDecoder(r.Body).Decode(&log); err != nil {
 		// TODO: Handle errors
 		newRespErr(statusBR, "invalid log object").WriteTo(w)
-    return
+		return
 	}
 	log.UserId = userId
 	if log.Timestamp <= 0 {
@@ -797,10 +797,10 @@ func (s *Server) NewJournalHandler(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewDecoder(r.Body).Decode(&journal); err != nil {
 		// TODO: Handle errors
 		newRespErr(statusBR, "invalid journal object").WriteTo(w)
-    return
-  } else if journal.Contents == "" {
+		return
+	} else if journal.Contents == "" {
 		newRespErr(statusBR, "empty journal contents").WriteTo(w)
-    return
+		return
 	}
 	journal.UserId = userId
 	if journal.Timestamp <= 0 {
@@ -837,7 +837,7 @@ func (s *Server) generateJournalsDirPath(userId uint64) string {
 func (s *Server) generateJournalPath(userId, journalId uint64) string {
 	return filepath.Join(
 		s.generateJournalsDirPath(userId),
-		strconv.FormatUint(journalId, 10) + ".txt",
+		strconv.FormatUint(journalId, 10)+".txt",
 	)
 }
 
@@ -865,9 +865,9 @@ func (s *Server) newJournal(journal *Journal) error {
 
 func (s *Server) writeJournalContents(path, contents string) error {
 	return os.WriteFile(
-    filepath.Join(s.journalsDir, path),
-    []byte(contents), 0755,
-  )
+		filepath.Join(s.journalsDir, path),
+		[]byte(contents), 0755,
+	)
 }
 
 func (s *Server) DeleteJournalHandler(w http.ResponseWriter, r *http.Request) {
@@ -910,7 +910,7 @@ func (s *Server) deleteJournal(journal Journal) error {
 	if err != nil {
 		return err
 	}
-  return s.deleteJournalContents(journal.path)
+	return s.deleteJournalContents(journal.path)
 }
 
 func (s *Server) deleteJournalContents(path string) error {
@@ -936,13 +936,13 @@ func newRespErr(status int, errMsg string) *Resp {
 }
 
 func (resp *Resp) WriteTo(w io.Writer) (n int64, err error) {
-  if rw, ok := w.(http.ResponseWriter); ok {
-    rw.Header().Set("Content-Type", "application/json")
-    rw.WriteHeader(resp.Status)
-    c := newCW(rw)
-    err = json.NewEncoder(c).Encode(resp)
-    return
-  }
+	if rw, ok := w.(http.ResponseWriter); ok {
+		rw.Header().Set("Content-Type", "application/json")
+		rw.WriteHeader(resp.Status)
+		c := newCW(rw)
+		err = json.NewEncoder(c).Encode(resp)
+		return
+	}
 	c := newCW(w)
 	err = json.NewEncoder(c).Encode(resp)
 	return int64(c.N()), err
@@ -950,7 +950,7 @@ func (resp *Resp) WriteTo(w io.Writer) (n int64, err error) {
 
 func sendErrResp(w http.ResponseWriter, r *http.Request, resp *Resp) {
 	if wantsHTML(r) {
-    http.Error(w, resp.Error, resp.Status)
+		http.Error(w, resp.Error, resp.Status)
 	} else {
 		resp.WriteTo(w)
 	}
